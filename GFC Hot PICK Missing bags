@@ -1,0 +1,1428 @@
+// ==UserScript==
+// @name         Hot Pick Missing Bags
+// @namespace    https://na.store-management.f3.amazon.dev/
+// @version      1.0.0
+// @description  Automates the hot pick workflow for missing grocery bags across Store Management and Associate Tools pages
+// @match        https://na.store-management.f3.amazon.dev/search/details*
+// @match        https://ui.us-west-2.prod.associatetools.ihm.amazon.dev/*
+// @grant        GM_addStyle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------------------
+  // Constants
+  // ---------------------------------------------------------------------------
+
+  var STALE_THRESHOLD = 60 * 60 * 1000; // 1 hour
+
+  // ---------------------------------------------------------------------------
+  // Pure utility functions
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Validates tote identifier input.
+   * @param {string} input - Raw user input
+   * @returns {{ valid: boolean, error?: string, sanitized?: string }}
+   */
+  function validateToteId(input) {
+    if (!input || !/\S/.test(input)) {
+      return { valid: false, error: 'Please enter a tote ID' };
+    }
+    return { valid: true, sanitized: input.trim() };
+  }
+
+  /**
+   * Sets an input's value using the native HTMLInputElement.prototype.value setter,
+   * then dispatches 'input' and 'change' events with bubbles:true.
+   * This is required for React-controlled inputs.
+   *
+   * @param {HTMLInputElement} input - The input element to fill
+   * @param {string} value - The value to set
+   */
+  function setInputValue(input, value) {
+    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  /**
+   * Generates the Inventory Viewer URL for a given ASIN.
+   * @param {string} asin
+   * @returns {string} URL with hotpick params in query string
+   */
+  function generateInventoryViewerUrl(asin) {
+    var base = 'https://ui.us-west-2.prod.associatetools.ihm.amazon.dev/remote/ihm-associate-tools-base/index.html';
+    var params = '?auth=midway&domain=prod&region=iad&storeId=US-NC-24';
+    params += '&hotpick-asin=' + encodeURIComponent(asin);
+    return base + params + '#/home';
+  }
+
+  /**
+   * Generates the Remove Inventory URL with all pre-fill parameters.
+   * @param {string} asin
+   * @param {string|null} location - Bin location (from inventory lookup)
+   * @param {number} quantity
+   * @returns {string} URL with hotpick params in query string
+   */
+  function generateRemoveInventoryUrl(asin, location, quantity) {
+    var base = 'https://ui.us-west-2.prod.associatetools.ihm.amazon.dev/remote/ihm-associate-tools-base/index.html';
+    var params = '?auth=midway&domain=prod&region=iad&storeId=US-NC-24';
+    params += '&hotpick-asin=' + encodeURIComponent(asin);
+    if (quantity != null) {
+      params += '&hotpick-qty=' + encodeURIComponent(String(quantity));
+    }
+    if (location != null && location !== '') {
+      params += '&hotpick-location=' + encodeURIComponent(location);
+    }
+    return base + params + '#/home';
+  }
+
+  /**
+   * Computes totals from an array of scraped items.
+   * @param {Array<{asin: string, description: string, quantity: number}>} items
+   * @returns {{ totalUniqueItems: number, totalQuantity: number }}
+   */
+  function computeTotals(items) {
+    if (!items || items.length === 0) {
+      return { totalUniqueItems: 0, totalQuantity: 0 };
+    }
+    var seen = {};
+    var totalQuantity = 0;
+    for (var i = 0; i < items.length; i++) {
+      seen[items[i].asin] = true;
+      totalQuantity += items[i].quantity;
+    }
+    var totalUniqueItems = Object.keys(seen).length;
+    return { totalUniqueItems: totalUniqueItems, totalQuantity: totalQuantity };
+  }
+
+  /**
+   * Shows a banner at the top of the page prompting the user to press Enter.
+   * Auto-removes after 10 seconds or when user presses Enter.
+   */
+  function showEnterBanner(doc, message) {
+    try {
+      var banner = doc.createElement('div');
+      banner.id = 'hotpick-enter-banner';
+      banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;background:#0d9488;color:#fff;text-align:center;padding:12px 20px;font-size:18px;font-weight:bold;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3);';
+      banner.textContent = '\u2328\uFE0F ' + message;
+      doc.body.insertBefore(banner, doc.body.firstChild);
+
+      // Remove on Enter key
+      function onKey(e) {
+        if (e.key === 'Enter') {
+          removeBanner();
+        }
+      }
+      doc.addEventListener('keydown', onKey);
+
+      // Auto-remove after 10 seconds
+      var timeout = setTimeout(removeBanner, 10000);
+
+      function removeBanner() {
+        doc.removeEventListener('keydown', onKey);
+        clearTimeout(timeout);
+        if (banner.parentNode) banner.parentNode.removeChild(banner);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  /**
+   * Cleans up stale hotpick_loc_* keys from localStorage.
+   * Removes any entries older than STALE_THRESHOLD (default 1 hour).
+   * Non-blocking — if cleanup fails, the rest of the page logic still works.
+   */
+  function cleanupStaleLocationData() {
+    try {
+      var now = Date.now();
+      var keysToRemove = [];
+
+      for (var i = 0; i < localStorage.length; i++) {
+        var key = localStorage.key(i);
+        if (!key || key.indexOf('hotpick_loc_') !== 0) continue;
+
+        try {
+          var raw = localStorage.getItem(key);
+          if (!raw) {
+            keysToRemove.push(key);
+            continue;
+          }
+          var parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed.timestamp !== 'number') {
+            keysToRemove.push(key);
+            continue;
+          }
+          if (now - parsed.timestamp > STALE_THRESHOLD) {
+            keysToRemove.push(key);
+          }
+        } catch (e) {
+          keysToRemove.push(key);
+        }
+      }
+
+      for (var j = 0; j < keysToRemove.length; j++) {
+        localStorage.removeItem(keysToRemove[j]);
+      }
+    } catch (e) {
+      console.warn('[Hot Pick Missing Bags] Error during stale data cleanup:', e);
+    }
+  }
+
+  /**
+   * Scrapes the current Store Management page DOM for item rows.
+   * Looks for table rows containing ASIN patterns (10 alphanumeric chars),
+   * descriptions, and quantities.
+   *
+   * @returns {Array<{asin: string, description: string, quantity: number}>}
+   */
+  function scrapeItemsFromPage() {
+    try {
+      var items = [];
+      var ASIN_REGEX = /^[A-Z0-9]{10}$/;
+
+      var tables = document.querySelectorAll('table');
+      if (!tables || tables.length === 0) {
+        return [];
+      }
+
+      for (var t = 0; t < tables.length; t++) {
+        var rows = tables[t].querySelectorAll('tr');
+        if (!rows) continue;
+
+        for (var r = 0; r < rows.length; r++) {
+          var cells = rows[r].querySelectorAll('td');
+          if (!cells || cells.length < 2) continue;
+
+          var asin = null;
+          var description = '';
+          var quantity = 0;
+
+          // First pass: find ASIN and quantity
+          for (var c = 0; c < cells.length; c++) {
+            var cellText = (cells[c].textContent || '').trim();
+
+            if (!asin && ASIN_REGEX.test(cellText)) {
+              asin = cellText;
+            } else if (asin && !quantity && /^\d+$/.test(cellText) && parseInt(cellText, 10) > 0) {
+              quantity = parseInt(cellText, 10);
+            }
+          }
+
+          // Second pass: get the LAST long text cell as description (Title is the last column)
+          if (asin) {
+            for (var c2 = cells.length - 1; c2 >= 0; c2--) {
+              var cellText2 = (cells[c2].textContent || '').trim();
+              if (cellText2.length > 10 && !ASIN_REGEX.test(cellText2) && !/^\d+$/.test(cellText2)) {
+                description = cellText2;
+                break;
+              }
+            }
+          }
+
+          if (asin) {
+            items.push({
+              asin: asin,
+              description: description || '',
+              quantity: quantity || 1
+            });
+          }
+        }
+      }
+
+      return items;
+    } catch (e) {
+      console.warn('[Hot Pick Missing Bags] Error scraping items from page:', e);
+      return [];
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Modal table renderer
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Renders the modal table overlay with scraped items and action links.
+   * Styled like the Shortage Review panel (white background, clean table, overlay backdrop).
+   *
+   * @param {Array<{asin: string, description: string, quantity: number}>} items
+   * @param {string} toteId - The tote ID entered by the user
+   */
+  function renderModal(items, toteId) {
+    var existing = document.getElementById('hotpick-modal-overlay');
+    if (existing) existing.remove();
+
+    var prevFocus = document.activeElement;
+
+    var overlay = document.createElement('div');
+    overlay.id = 'hotpick-modal-overlay';
+
+    var panel = document.createElement('div');
+    panel.id = 'hotpick-modal-panel';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-labelledby', 'hotpick-modal-title');
+
+    // --- Header ---
+    var header = document.createElement('div');
+    header.className = 'hotpick-modal-header';
+
+    var title = document.createElement('h2');
+    title.id = 'hotpick-modal-title';
+    title.textContent = 'Hot Pick \u2014 Tote: ' + toteId;
+
+    var closeBtn = document.createElement('button');
+    closeBtn.className = 'hotpick-close-btn';
+    closeBtn.setAttribute('aria-label', 'Close hot pick modal');
+    closeBtn.textContent = '\u00D7';
+
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+
+    // --- Body ---
+    var body = document.createElement('div');
+    body.className = 'hotpick-modal-body';
+
+    // Handle empty items case
+    if (!items || items.length === 0) {
+      var emptyMsg = document.createElement('p');
+      emptyMsg.className = 'hotpick-empty-message';
+      emptyMsg.textContent = 'No items found \u2014 verify you\u2019re on the correct tote details page';
+      body.appendChild(emptyMsg);
+
+      panel.appendChild(header);
+      panel.appendChild(body);
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+
+      closeBtn.focus();
+
+      function hideModalEmpty() {
+        document.removeEventListener('keydown', onKeyDownEmpty);
+        document.removeEventListener('keydown', onTrapFocusEmpty);
+        overlay.remove();
+        if (prevFocus && prevFocus.focus) prevFocus.focus();
+      }
+
+      function onKeyDownEmpty(e) {
+        if (e.key === 'Escape') hideModalEmpty();
+      }
+
+      function onTrapFocusEmpty(e) {
+        if (e.key !== 'Tab') return;
+        var focusable = Array.from(overlay.querySelectorAll('button, a[href], [tabindex]:not([tabindex="-1"])')).filter(function (el) { return !el.disabled; });
+        if (!focusable.length) return;
+        var first = focusable[0];
+        var last = focusable[focusable.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+
+      closeBtn.addEventListener('click', hideModalEmpty);
+      document.addEventListener('keydown', onKeyDownEmpty);
+      document.addEventListener('keydown', onTrapFocusEmpty);
+
+      return overlay;
+    }
+
+    // --- Totals summary ---
+    var totals = computeTotals(items);
+    var summary = document.createElement('div');
+    summary.className = 'hotpick-summary';
+    summary.textContent = totals.totalUniqueItems + ' unique item' + (totals.totalUniqueItems !== 1 ? 's' : '') +
+      ' \u2022 ' + totals.totalQuantity + ' total unit' + (totals.totalQuantity !== 1 ? 's' : '');
+
+    // --- Table ---
+    var table = document.createElement('table');
+    table.className = 'hotpick-modal-table';
+
+    var thead = document.createElement('thead');
+    var headerRow = document.createElement('tr');
+    var columns = ['ASIN', 'Description', 'Quantity', 'Location', 'Remove Inventory'];
+    for (var h = 0; h < columns.length; h++) {
+      var th = document.createElement('th');
+      th.textContent = columns[h];
+      headerRow.appendChild(th);
+    }
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var row = document.createElement('tr');
+      row.setAttribute('data-asin', item.asin);
+
+      var asinCell = document.createElement('td');
+      asinCell.className = 'hotpick-asin';
+      asinCell.textContent = item.asin;
+      row.appendChild(asinCell);
+
+      var descCell = document.createElement('td');
+      descCell.className = 'hotpick-description';
+      descCell.textContent = item.description;
+      row.appendChild(descCell);
+
+      var qtyCell = document.createElement('td');
+      qtyCell.className = 'hotpick-quantity';
+      qtyCell.textContent = String(item.quantity);
+      row.appendChild(qtyCell);
+
+      var locCell = document.createElement('td');
+      locCell.className = 'hotpick-location';
+      var location = null;
+      try {
+        var stored = GM_getValue('hotpick_loc_' + item.asin, null);
+        if (stored) {
+          var parsed = JSON.parse(stored);
+          if (parsed && parsed.location) {
+            location = parsed.location;
+          }
+        }
+      } catch (e) { /* ignore localStorage errors */ }
+
+      if (location) {
+        locCell.textContent = location;
+      } else {
+        var locLink = document.createElement('a');
+        locLink.href = generateInventoryViewerUrl(item.asin);
+        locLink.target = '_blank';
+        locLink.rel = 'noopener';
+        locLink.className = 'hotpick-action-link';
+        locLink.textContent = 'Find Location \u2192';
+        locCell.appendChild(locLink);
+      }
+      row.appendChild(locCell);
+
+      var removeCell = document.createElement('td');
+      removeCell.className = 'hotpick-remove';
+      var removeLink = document.createElement('a');
+      removeLink.href = generateRemoveInventoryUrl(item.asin, location, item.quantity);
+      removeLink.target = '_blank';
+      removeLink.rel = 'noopener';
+      removeLink.className = 'hotpick-action-link';
+      removeLink.textContent = 'Remove Inventory \u2192';
+      removeCell.appendChild(removeLink);
+      row.appendChild(removeCell);
+
+      tbody.appendChild(row);
+    }
+
+    table.appendChild(tbody);
+
+    body.appendChild(summary);
+    body.appendChild(table);
+
+    panel.appendChild(header);
+    panel.appendChild(body);
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+
+    closeBtn.focus();
+
+    // --- Cross-tab location updates via GM_addValueChangeListener ---
+    var gmListenerIds = [];
+
+    for (var li = 0; li < items.length; li++) {
+      (function(itemAsin) {
+        var listenerId = GM_addValueChangeListener('hotpick_loc_' + itemAsin, function(name, old_value, new_value, remote) {
+          if (!new_value) return;
+          try {
+            var data = JSON.parse(new_value);
+            if (!data || !data.location) return;
+
+            var row = overlay.querySelector('tr[data-asin="' + itemAsin + '"]');
+            if (!row) return;
+
+            var locCell = row.querySelector('.hotpick-location');
+            if (locCell) {
+              if (data.location === '__NO_INVENTORY__') {
+                // No inventory found — show red bold message
+                locCell.innerHTML = '<span style="color: red; font-weight: bold;">No Inventory Found</span>';
+              } else if (data.isToteOnly) {
+                // Tote only — highlight in orange as warning
+                locCell.innerHTML = '<span style="color: #d97706; font-weight: bold;" title="Only available in tote — no bin location">\u26A0\uFE0F ' + data.location + '</span>';
+              } else {
+                locCell.textContent = data.location;
+              }
+            }
+
+            var removeCell = row.querySelector('.hotpick-remove');
+            if (removeCell) {
+              var removeLink = removeCell.querySelector('a');
+              if (removeLink) {
+                if (data.location === '__NO_INVENTORY__') {
+                  removeLink.style.display = 'none';
+                } else {
+                  var qty = row.querySelector('.hotpick-quantity');
+                  var quantity = qty ? parseInt(qty.textContent, 10) || 1 : 1;
+                  removeLink.href = generateRemoveInventoryUrl(itemAsin, data.location, quantity);
+                }
+              }
+            }
+          } catch (e) {
+            // Ignore parse errors
+          }
+        });
+        gmListenerIds.push(listenerId);
+      })(items[li].asin);
+    }
+
+    // --- Close handlers ---
+    function hideModal() {
+      for (var g = 0; g < gmListenerIds.length; g++) {
+        GM_removeValueChangeListener(gmListenerIds[g]);
+      }
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('keydown', onTrapFocus);
+      overlay.remove();
+      if (prevFocus && prevFocus.focus) prevFocus.focus();
+    }
+
+    function onKeyDown(e) {
+      if (e.key === 'Escape') hideModal();
+    }
+
+    function onTrapFocus(e) {
+      if (e.key !== 'Tab') return;
+      var focusable = Array.from(overlay.querySelectorAll('button, a[href], [tabindex]:not([tabindex="-1"])')).filter(function (el) { return !el.disabled; });
+      if (!focusable.length) return;
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+
+    closeBtn.addEventListener('click', hideModal);
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('keydown', onTrapFocus);
+
+    return overlay;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Page logic
+  // ---------------------------------------------------------------------------
+
+  function runStoreManagementPage() {
+    if (document.getElementById('hotpick-pill')) return;
+
+    // Reset all hotpick location data on page load/refresh
+    try {
+      var allKeys = GM_listValues();
+      for (var k = 0; k < allKeys.length; k++) {
+        if (allKeys[k].indexOf('hotpick_loc_') === 0) {
+          GM_deleteValue(allKeys[k]);
+        }
+      }
+    } catch (e) { /* ignore */ }
+
+    // -------------------------------------------------------------------------
+    // Collapsed pill widget injection
+    // -------------------------------------------------------------------------
+
+    GM_addStyle(
+      '#hotpick-pill {' +
+        'position: fixed;' +
+        'top: 80px;' +
+        'right: 12px;' +
+        'z-index: 999998;' +
+        'background: #0d9488;' +
+        'color: #fff;' +
+        'border-radius: 24px;' +
+        'padding: 12px 22px;' +
+        'font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;' +
+        'font-size: 16px;' +
+        'cursor: grab;' +
+        'user-select: none;' +
+        'box-shadow: 0 2px 8px rgba(0,0,0,0.25);' +
+        'white-space: nowrap;' +
+      '}' +
+      '#hotpick-pill.hotpick-dragging {' +
+        'cursor: grabbing;' +
+        'opacity: 0.9;' +
+      '}' +
+      '#hotpick-pill.hotpick-expanded {' +
+        'border-radius: 14px;' +
+        'padding: 16px 22px;' +
+        'display: flex;' +
+        'flex-direction: column;' +
+        'gap: 10px;' +
+        'white-space: normal;' +
+      '}' +
+      '#hotpick-pill .hotpick-label {' +
+        'cursor: pointer;' +
+        'font-weight: 600;' +
+      '}' +
+      '#hotpick-pill .hotpick-form {' +
+        'display: none;' +
+        'flex-direction: row;' +
+        'align-items: center;' +
+        'gap: 8px;' +
+      '}' +
+      '#hotpick-pill.hotpick-expanded .hotpick-form {' +
+        'display: flex;' +
+      '}' +
+      '#hotpick-input {' +
+        'border: 1px solid #5eead4;' +
+        'border-radius: 6px;' +
+        'padding: 8px 12px;' +
+        'font-size: 15px;' +
+        'width: 200px;' +
+        'outline: none;' +
+        'background: #115e59;' +
+        'color: #fff;' +
+      '}' +
+      '#hotpick-input::placeholder {' +
+        'color: #99f6e4;' +
+      '}' +
+      '#hotpick-input:focus {' +
+        'border-color: #2dd4bf;' +
+      '}' +
+      '#hotpick-submit-btn {' +
+        'background: #14b8a6;' +
+        'color: #fff;' +
+        'border: none;' +
+        'border-radius: 6px;' +
+        'padding: 8px 16px;' +
+        'font-size: 15px;' +
+        'cursor: pointer;' +
+        'font-weight: 600;' +
+      '}' +
+      '#hotpick-submit-btn:hover {' +
+        'background: #0f766e;' +
+      '}' +
+      '#hotpick-error {' +
+        'color: #fca5a5;' +
+        'font-size: 12px;' +
+        'display: none;' +
+      '}' +
+      '#hotpick-modal-overlay {' +
+        'position: fixed;' +
+        'inset: 0;' +
+        'z-index: 999999;' +
+        'background: rgba(0,0,0,0.5);' +
+      '}' +
+      '#hotpick-modal-panel {' +
+        'position: absolute;' +
+        'top: 50%;' +
+        'left: 50%;' +
+        'transform: translate(-50%,-50%);' +
+        'min-width: 680px;' +
+        'max-width: 900px;' +
+        'max-height: 82vh;' +
+        'overflow-y: auto;' +
+        'background: #fff;' +
+        'border-radius: 8px;' +
+        'padding: 24px;' +
+        'box-shadow: 0 4px 24px rgba(0,0,0,0.2);' +
+        'font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;' +
+      '}' +
+      '.hotpick-modal-header {' +
+        'display: flex;' +
+        'align-items: center;' +
+        'justify-content: space-between;' +
+        'margin-bottom: 16px;' +
+        'border-bottom: 1px solid #e0e0e0;' +
+        'padding-bottom: 12px;' +
+      '}' +
+      '.hotpick-modal-header h2 {' +
+        'margin: 0;' +
+        'font-size: 18px;' +
+        'font-weight: 600;' +
+        'color: #111;' +
+      '}' +
+      '.hotpick-close-btn {' +
+        'background: none;' +
+        'border: none;' +
+        'font-size: 22px;' +
+        'cursor: pointer;' +
+        'color: #555;' +
+        'line-height: 1;' +
+        'padding: 0 4px;' +
+      '}' +
+      '.hotpick-close-btn:hover {' +
+        'color: #000;' +
+      '}' +
+      '.hotpick-summary {' +
+        'font-size: 12px;' +
+        'color: #666;' +
+        'margin-bottom: 12px;' +
+      '}' +
+      '.hotpick-modal-table {' +
+        'width: 100%;' +
+        'border-collapse: collapse;' +
+        'font-size: 13px;' +
+      '}' +
+      '.hotpick-modal-table th, .hotpick-modal-table td {' +
+        'padding: 8px 12px;' +
+        'text-align: left;' +
+        'border-bottom: 1px solid #e8e8e8;' +
+        'vertical-align: top;' +
+      '}' +
+      '.hotpick-modal-table th {' +
+        'background: #f5f5f5;' +
+        'font-weight: 600;' +
+        'font-size: 12px;' +
+        'text-transform: uppercase;' +
+        'letter-spacing: 0.04em;' +
+        'color: #444;' +
+      '}' +
+      '.hotpick-modal-table tr:hover td {' +
+        'background: #fafafa;' +
+      '}' +
+      '.hotpick-asin {' +
+        'font-family: monospace;' +
+        'font-size: 12px;' +
+      '}' +
+      '.hotpick-description {' +
+        'max-width: 260px;' +
+        'white-space: nowrap;' +
+        'overflow: hidden;' +
+        'text-overflow: ellipsis;' +
+        'color: #333;' +
+      '}' +
+      '.hotpick-action-link {' +
+        'color: #0d9488;' +
+        'text-decoration: none;' +
+        'font-size: 12px;' +
+        'white-space: nowrap;' +
+      '}' +
+      '.hotpick-action-link:hover {' +
+        'text-decoration: underline;' +
+      '}' +
+      '.hotpick-empty-message {' +
+        'color: #666;' +
+        'font-style: italic;' +
+        'font-size: 14px;' +
+        'padding: 24px 0;' +
+        'text-align: center;' +
+      '}'
+    );
+
+    // Create pill DOM
+    var pill = document.createElement('div');
+    pill.id = 'hotpick-pill';
+
+    var label = document.createElement('span');
+    label.className = 'hotpick-label';
+    label.textContent = '\uD83D\uDED2 Missing Bag?';
+
+    var form = document.createElement('div');
+    form.className = 'hotpick-form';
+
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.id = 'hotpick-input';
+    input.placeholder = 'Tote ID';
+
+    var submitBtn = document.createElement('button');
+    submitBtn.id = 'hotpick-submit-btn';
+    submitBtn.textContent = 'Go';
+
+    var errorSpan = document.createElement('span');
+    errorSpan.id = 'hotpick-error';
+    errorSpan.style.display = 'none';
+
+    form.appendChild(input);
+    form.appendChild(submitBtn);
+
+    pill.appendChild(label);
+    pill.appendChild(form);
+    pill.appendChild(errorSpan);
+    document.body.appendChild(pill);
+
+    label.addEventListener('click', function () {
+      pill.classList.toggle('hotpick-expanded');
+      if (pill.classList.contains('hotpick-expanded')) {
+        input.focus();
+      }
+    });
+
+    function handleSubmit() {
+      var result = validateToteId(input.value);
+      if (!result.valid) {
+        errorSpan.textContent = result.error;
+        errorSpan.style.display = '';
+        return;
+      }
+      errorSpan.textContent = '';
+      errorSpan.style.display = 'none';
+
+      var items = scrapeItemsFromPage();
+      renderModal(items, result.sanitized);
+    }
+
+    submitBtn.addEventListener('click', handleSubmit);
+
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        handleSubmit();
+      }
+    });
+    input.addEventListener('keypress', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        handleSubmit();
+      }
+    });
+
+    // Make pill draggable with localStorage position persistence
+    (function () {
+      var STORAGE_KEY = 'hotpick-widget-pos';
+      var isDragging = false;
+      var startX, startY, startLeft, startTop;
+
+      try {
+        var saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+        if (saved && typeof saved.left === 'number' && typeof saved.top === 'number') {
+          var maxLeft = window.innerWidth - pill.offsetWidth - 8;
+          var maxTop = window.innerHeight - pill.offsetHeight - 8;
+          pill.style.right = 'auto';
+          pill.style.left = Math.min(Math.max(0, saved.left), maxLeft) + 'px';
+          pill.style.top = Math.min(Math.max(0, saved.top), maxTop) + 'px';
+        }
+      } catch (e) { /* ignore */ }
+
+      pill.addEventListener('mousedown', function (e) {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+        isDragging = true;
+        pill.classList.add('hotpick-dragging');
+        var rect = pill.getBoundingClientRect();
+        startX = e.clientX;
+        startY = e.clientY;
+        startLeft = rect.left;
+        startTop = rect.top;
+        pill.style.right = 'auto';
+        pill.style.left = startLeft + 'px';
+        pill.style.top = startTop + 'px';
+        e.preventDefault();
+      });
+
+      document.addEventListener('mousemove', function (e) {
+        if (!isDragging) return;
+        pill.style.left = (startLeft + (e.clientX - startX)) + 'px';
+        pill.style.top = (startTop + (e.clientY - startY)) + 'px';
+      });
+
+      document.addEventListener('mouseup', function () {
+        if (!isDragging) return;
+        isDragging = false;
+        pill.classList.remove('hotpick-dragging');
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            left: parseFloat(pill.style.left),
+            top: parseFloat(pill.style.top)
+          }));
+        } catch (e) { /* ignore */ }
+      });
+    })();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Inventory Viewer page logic (parent frame)
+  // ---------------------------------------------------------------------------
+
+  function runInventoryViewerPage() {
+    var search = window.location.search || '';
+    var asinMatch = search.match(/hotpick-asin=([^&]*)/);
+    if (!asinMatch || !asinMatch[1]) {
+      return;
+    }
+
+    var asin;
+    try {
+      asin = decodeURIComponent(asinMatch[1]);
+    } catch (e) {
+      console.warn('[Hot Pick Missing Bags] Failed to decode ASIN from query:', e);
+      return;
+    }
+
+    if (!asin || !asin.trim()) {
+      return;
+    }
+    asin = asin.trim();
+
+    function clickInventoryViewer() {
+      var sidebarItem = document.querySelector('tr[data-atb-id="sideBar-inventory_viewer_v2"]');
+      if (sidebarItem) {
+        try {
+          localStorage.setItem('hotpick_pending_asin', asin);
+        } catch (e) { /* ignore */ }
+        sidebarItem.click();
+        waitForInputAndFill(asin);
+        return true;
+      }
+      return false;
+    }
+
+    if (!clickInventoryViewer()) {
+      var attempts = 0;
+      var maxAttempts = 20;
+      var interval = setInterval(function () {
+        attempts++;
+        if (clickInventoryViewer() || attempts >= maxAttempts) {
+          clearInterval(interval);
+        }
+      }, 500);
+    }
+  }
+
+  /**
+   * Waits for an input field to appear on the Inventory Viewer page, then fills it with the ASIN.
+   * The Inventory Viewer loads inside an iframe, so we access it there.
+   */
+  function waitForInputAndFill(asin) {
+    var attempts = 0;
+    var maxAttempts = 30;
+    var interval = setInterval(function () {
+      attempts++;
+
+      var iframe = document.querySelector('iframe[aria-label="inventory_viewer_v2"]');
+      var inputEl = null;
+
+      if (iframe && iframe.contentDocument) {
+        try {
+          inputEl = iframe.contentDocument.querySelector('input[data-id="OmniboxId"]') ||
+                    iframe.contentDocument.querySelector('input[placeholder*="Scan or type product"]') ||
+                    iframe.contentDocument.querySelector('input[type="text"]');
+        } catch (e) {
+          console.warn('[Hot Pick Missing Bags] Cannot access iframe content (cross-origin):', e);
+          clearInterval(interval);
+          return;
+        }
+      }
+
+      if (!inputEl) {
+        inputEl = document.querySelector('input[data-id="OmniboxId"]') ||
+                  document.querySelector('input[placeholder*="Scan or type product"]') ||
+                  document.querySelector('input[type="text"]');
+      }
+
+      if (inputEl) {
+        clearInterval(interval);
+        try {
+          inputEl.focus();
+          setInputValue(inputEl, asin);
+        } catch (e) {
+          console.warn('[Hot Pick Missing Bags] Failed to auto-fill ASIN:', e);
+        }
+        waitForResultsAndStore(asin);
+      } else if (attempts >= maxAttempts) {
+        clearInterval(interval);
+        console.warn('[Hot Pick Missing Bags] Could not find search input field on Inventory Viewer page');
+      }
+    }, 500);
+  }
+
+  /**
+   * Polls the Inventory Viewer iframe for results, then finds best location and stores it.
+   * Uses GM_setValue for cross-domain communication between tabs.
+   */
+  function waitForResultsAndStore(asin) {
+    var attempts = 0;
+    var maxAttempts = 120; // 60 seconds — user needs to press Enter manually
+    var pollInterval = setInterval(function () {
+      attempts++;
+
+      var iframe = document.querySelector('iframe[aria-label="inventory_viewer_v2"]');
+      if (iframe && iframe.contentDocument) {
+        try {
+          var tables = iframe.contentDocument.querySelectorAll('table');
+          if (tables && tables.length > 0) {
+            var hasDataRows = false;
+            for (var t = 0; t < tables.length; t++) {
+              var rows = tables[t].querySelectorAll('td');
+              if (rows && rows.length > 0) {
+                hasDataRows = true;
+                break;
+              }
+            }
+            if (hasDataRows) {
+              clearInterval(pollInterval);
+              var bestLocation = findBestLocationInIframe(iframe);
+              if (bestLocation && bestLocation.location) {
+                try {
+                  GM_setValue('hotpick_loc_' + asin, JSON.stringify({
+                    asin: asin,
+                    location: bestLocation.location,
+                    unitCount: bestLocation.unitCount || 0,
+                    timestamp: Date.now()
+                  }));
+                } catch (e) {
+                  console.warn('[Hot Pick Missing Bags] Failed to store location:', e);
+                }
+              }
+              return;
+            }
+          }
+        } catch (e) {
+          console.warn('[Hot Pick Missing Bags] Cannot access iframe content:', e);
+          clearInterval(pollInterval);
+          return;
+        }
+      }
+
+      if (attempts >= maxAttempts) {
+        clearInterval(pollInterval);
+        console.warn('[Hot Pick Missing Bags] Timed out waiting for inventory results');
+      }
+    }, 500);
+  }
+
+  /**
+   * Waits for inventory results inside the iframe, then scrapes and stores location.
+   * This runs INSIDE the iframe document context.
+   */
+  function waitForIframeResults(asin) {
+    var attempts = 0;
+    var maxAttempts = 120; // 60 seconds
+    var pollInterval = setInterval(function () {
+      attempts++;
+
+      var LOCATION_REGEX = /^[A-Za-z0-9]+-[A-Za-z0-9]+-?[A-Za-z0-9]*$/;
+      var TOTE_REGEX = /^Tote\s+\S+$/i;
+      var tables = document.querySelectorAll('table');
+      var bestBinLocation = null;
+      var bestToteLocation = null;
+      var highestBinCount = -1;
+      var highestToteCount = -1;
+
+      if (tables && tables.length > 0) {
+        for (var t = 0; t < tables.length; t++) {
+          var rows = tables[t].querySelectorAll('tr');
+          if (!rows) continue;
+          for (var r = 0; r < rows.length; r++) {
+            var cells = rows[r].querySelectorAll('td');
+            if (!cells || cells.length < 2) continue;
+            var location = null;
+            var isTote = false;
+            var unitCount = 0;
+            for (var c = 0; c < cells.length; c++) {
+              var cellText = (cells[c].textContent || '').trim();
+              if (!location && LOCATION_REGEX.test(cellText)) {
+                location = cellText;
+                isTote = false;
+              } else if (!location && TOTE_REGEX.test(cellText)) {
+                location = cellText;
+                isTote = true;
+              } else if (/^\d+$/.test(cellText) && parseInt(cellText, 10) > 0) {
+                unitCount = parseInt(cellText, 10);
+              }
+            }
+            if (location && !isTote && unitCount > highestBinCount) {
+              highestBinCount = unitCount;
+              bestBinLocation = { location: location, unitCount: unitCount };
+            } else if (location && isTote && unitCount > highestToteCount) {
+              highestToteCount = unitCount;
+              bestToteLocation = { location: location, unitCount: unitCount };
+            }
+          }
+        }
+      }
+
+      // Also try scanning text for location-like patterns
+      if (!bestBinLocation && !bestToteLocation) {
+        var allText = document.body ? document.body.innerText : '';
+        // Look for bin patterns first
+        var locationMatches = allText.match(/([A-Z][A-Za-z0-9]*-[A-Za-z0-9]+-[A-Za-z0-9]+)/g);
+        if (locationMatches && locationMatches.length > 0) {
+          bestBinLocation = { location: locationMatches[0], unitCount: 1 };
+        }
+        // Look for tote patterns only if no bin found
+        if (!bestBinLocation) {
+          var toteMatches = allText.match(/Tote\s+([A-Za-z0-9]+)/gi);
+          if (toteMatches && toteMatches.length > 0) {
+            bestToteLocation = { location: toteMatches[0], unitCount: 1 };
+          }
+        }
+      }
+
+      // Prefer bin location; only use tote if no bin available
+      var bestLocation = bestBinLocation || bestToteLocation;
+      var isToteOnly = !bestBinLocation && !!bestToteLocation;
+
+      if (bestLocation) {
+        clearInterval(pollInterval);
+        try {
+          GM_setValue('hotpick_loc_' + asin, JSON.stringify({
+            asin: asin,
+            location: bestLocation.location,
+            unitCount: bestLocation.unitCount || 0,
+            isToteOnly: isToteOnly,
+            timestamp: Date.now()
+          }));
+        } catch (e) {
+          console.warn('[Hot Pick Missing Bags] Failed to GM_setValue:', e);
+        }
+      } else if (attempts >= 30) {
+        // After 15 seconds of no location found, check if page shows zero inventory
+        var bodyText = document.body ? document.body.innerText : '';
+        // ONLY mark no inventory if we can confirm zero on-hand (not just timeout)
+        if (bodyText.indexOf('On-Hand 0') !== -1 || bodyText.indexOf('On-Hand: 0') !== -1 ||
+            bodyText.indexOf('Total On-Hand 0') !== -1 || bodyText.indexOf('Total On-Hand: 0') !== -1) {
+          clearInterval(pollInterval);
+          try {
+            GM_setValue('hotpick_loc_' + asin, JSON.stringify({
+              asin: asin,
+              location: '__NO_INVENTORY__',
+              unitCount: 0,
+              timestamp: Date.now()
+            }));
+          } catch (e) {}
+        }
+        // If we don't see zero on-hand text, keep polling until maxAttempts
+      } else if (attempts >= maxAttempts) {
+        clearInterval(pollInterval);
+        // Only timeout — don't mark as no inventory (user may not have pressed Enter yet)
+      }
+    }, 500);
+  }
+
+  /**
+   * Finds the best location from the Inventory Viewer iframe's DOM.
+   */
+  function findBestLocationInIframe(iframe) {
+    try {
+      var doc = iframe.contentDocument;
+      var LOCATION_REGEX = /^[A-Za-z0-9]+-[A-Za-z0-9]+-?[A-Za-z0-9]*$/;
+      var bestLocation = null;
+      var highestCount = -1;
+
+      var tables = doc.querySelectorAll('table');
+      if (!tables || tables.length === 0) return null;
+
+      for (var t = 0; t < tables.length; t++) {
+        var rows = tables[t].querySelectorAll('tr');
+        if (!rows) continue;
+
+        for (var r = 0; r < rows.length; r++) {
+          var cells = rows[r].querySelectorAll('td');
+          if (!cells || cells.length < 2) continue;
+
+          var location = null;
+          var unitCount = 0;
+
+          for (var c = 0; c < cells.length; c++) {
+            var cellText = (cells[c].textContent || '').trim();
+            if (!location && LOCATION_REGEX.test(cellText)) {
+              location = cellText;
+            } else if (/^\d+$/.test(cellText) && parseInt(cellText, 10) > 0) {
+              unitCount = parseInt(cellText, 10);
+            }
+          }
+
+          if (location && unitCount > highestCount) {
+            highestCount = unitCount;
+            bestLocation = { location: location, unitCount: unitCount };
+          }
+        }
+      }
+
+      return bestLocation;
+    } catch (e) {
+      console.warn('[Hot Pick Missing Bags] Error finding best location in iframe:', e);
+      return null;
+    }
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // Remove Inventory page logic
+  // ---------------------------------------------------------------------------
+
+  function runRemoveInventoryPage() {
+    var search = window.location.search || '';
+    var asinMatch = search.match(/hotpick-asin=([^&]*)/);
+    if (!asinMatch || !asinMatch[1]) return;
+
+    var asin, quantity, location;
+    try { asin = decodeURIComponent(asinMatch[1]).trim(); } catch (e) { return; }
+    if (!asin) return;
+
+    var qtyMatch = search.match(/hotpick-qty=([^&]*)/);
+    if (qtyMatch && qtyMatch[1]) { try { quantity = decodeURIComponent(qtyMatch[1]).trim(); } catch (e) {} }
+
+    var locMatch = search.match(/hotpick-location=([^&]*)/);
+    if (locMatch && locMatch[1]) { try { location = decodeURIComponent(locMatch[1]).trim(); } catch (e) {} }
+
+    // Click the Remove Inventory sidebar item
+    function clickRemoveInventory() {
+      var sidebarItem = document.querySelector('tr[data-atb-id="sideBar-remove_inventory"]');
+      if (sidebarItem) {
+        try { localStorage.setItem('hotpick_pending_asin', asin); } catch (e) {}
+        sidebarItem.click();
+        return true;
+      }
+      return false;
+    }
+
+    if (!clickRemoveInventory()) {
+      var attempts = 0;
+      var interval = setInterval(function () {
+        attempts++;
+        if (clickRemoveInventory() || attempts >= 20) clearInterval(interval);
+      }, 500);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Remove Inventory iframe handler — fills ASIN, location, Scan Bin, dropdowns, quantity
+  // ---------------------------------------------------------------------------
+
+  function handleRemoveInventoryIframe() {
+    var search = window.location.search || '';
+    var asinMatch = search.match(/hotpick-asin=([^&]*)/);
+    if (!asinMatch || !asinMatch[1]) return;
+
+    var asin, quantity, location;
+    try { asin = decodeURIComponent(asinMatch[1]).trim(); } catch (e) { return; }
+    if (!asin) return;
+
+    var qtyMatch = search.match(/hotpick-qty=([^&]*)/);
+    if (qtyMatch && qtyMatch[1]) { try { quantity = decodeURIComponent(qtyMatch[1]).trim(); } catch (e) {} }
+
+    var locMatch = search.match(/hotpick-location=([^&]*)/);
+    if (locMatch && locMatch[1]) { try { location = decodeURIComponent(locMatch[1]).trim(); } catch (e) {} }
+
+    // Step 1: Wait for ASIN input, fill it
+    var step1Attempts = 0;
+    var step1 = setInterval(function () {
+      step1Attempts++;
+      var input = document.querySelector('input[data-id="OmniboxId"]') ||
+                  document.querySelector('input[placeholder*="Scan or type product"]') ||
+                  document.querySelector('input[type="text"]');
+      if (input) {
+        clearInterval(step1);
+        input.focus();
+        setInputValue(input, asin);
+        // Show banner prompting user to press Enter
+        showEnterBanner(document, 'Press ENTER to look up item');
+        // Step 2: Wait for location field (user presses Enter)
+        waitForLocationStep(location, quantity);
+      } else if (step1Attempts >= 30) {
+        clearInterval(step1);
+      }
+    }, 500);
+  }
+
+  function waitForLocationStep(location, quantity) {
+    var attempts = 0;
+    var interval = setInterval(function () {
+      attempts++;
+      var locInput = document.querySelector('input[placeholder*="Scan a bin"]') ||
+                     document.querySelector('input[placeholder*="bin"]');
+      if (locInput) {
+        clearInterval(interval);
+        if (location) {
+          locInput.focus();
+          setInputValue(locInput, location);
+          // Click Scan Bin
+          setTimeout(function () {
+            var buttons = document.querySelectorAll('button');
+            for (var b = 0; b < buttons.length; b++) {
+              if (buttons[b].textContent.trim().toLowerCase().indexOf('scan bin') !== -1) {
+                buttons[b].click();
+                break;
+              }
+            }
+            // Step 3: Wait for reason/outcome/quantity form
+            setTimeout(function () {
+              handleReasonOutcomeQuantity(quantity);
+            }, 2000);
+          }, 500);
+        }
+      } else if (attempts >= 120) {
+        clearInterval(interval);
+      }
+    }, 500);
+  }
+
+  function handleReasonOutcomeQuantity(quantity) {
+    // Set quantity first (click + button)
+    var qty = quantity ? parseInt(quantity, 10) : 0;
+    if (qty > 0) {
+      var buttons = document.querySelectorAll('button');
+      for (var b = 0; b < buttons.length; b++) {
+        var btnInner = buttons[b].innerHTML;
+        if (btnInner.indexOf('+') !== -1 && buttons[b].textContent.trim().length <= 1) {
+          for (var i = 0; i < qty; i++) {
+            (function(btn, delay) { setTimeout(function() { btn.click(); }, delay); })(buttons[b], i * 200);
+          }
+          break;
+        }
+      }
+    }
+
+    // Open Reason dropdown using mousedown on combobox
+    var reasonCombobox = document.querySelector('[role="combobox"]');
+    if (reasonCombobox) {
+      reasonCombobox.focus();
+      reasonCombobox.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+      setTimeout(function () {
+        reasonCombobox.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        // Find and click "Damaged"
+        setTimeout(function () {
+          var allEls = document.querySelectorAll('li, [role="option"], div, span');
+          for (var i = 0; i < allEls.length; i++) {
+            var txt = allEls[i].textContent.trim();
+            if (txt === 'Damaged' || txt === 'DAMAGED' || txt.toLowerCase().indexOf('damaged') !== -1) {
+              if (txt.length < 20) {
+                allEls[i].click();
+                // Now handle Outcome
+                setTimeout(function () { handleOutcomeDropdown(); }, 1500);
+                return;
+              }
+            }
+          }
+        }, 1000);
+      }, 200);
+    }
+  }
+
+  function handleOutcomeDropdown() {
+    // Wait for second combobox to appear
+    var attempts = 0;
+    var interval = setInterval(function () {
+      attempts++;
+      var comboboxes = document.querySelectorAll('[role="combobox"]');
+      if (comboboxes.length >= 2) {
+        clearInterval(interval);
+        var outcomeCombobox = comboboxes[1];
+        outcomeCombobox.focus();
+        outcomeCombobox.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        setTimeout(function () {
+          outcomeCombobox.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          setTimeout(function () {
+            var allEls = document.querySelectorAll('li, [role="option"], div, span');
+            for (var i = 0; i < allEls.length; i++) {
+              var txt = allEls[i].textContent.trim();
+              if (txt === 'Donated' || txt === 'DONATED' || txt.toLowerCase().indexOf('donated') !== -1) {
+                if (txt.length < 20) {
+                  allEls[i].click();
+                  // Show banner prompting user to click Remove
+                  setTimeout(function () {
+                    showEnterBanner(document, 'Click REMOVE to complete');
+                  }, 500);
+                  return;
+                }
+              }
+            }
+          }, 1000);
+        }, 200);
+      } else if (attempts >= 10) {
+        clearInterval(interval);
+      }
+    }, 500);
+  }
+
+  // ---------------------------------------------------------------------------
+  // URL Router
+  // ---------------------------------------------------------------------------
+
+  if (typeof window !== 'undefined' && window.location) {
+    var url = window.location.href;
+    var isInIframe = (window.self !== window.top);
+    var search = window.location.search || '';
+    var hasAsin = search.indexOf('hotpick-asin') !== -1;
+    var hasQty = search.indexOf('hotpick-qty') !== -1;
+
+    if (isInIframe && hasAsin && url.indexOf('/remote/ihm-inventory-viewer-tool/') !== -1) {
+      // Inside Inventory Viewer iframe — fill ASIN and wait for results
+      (function() {
+        var iframeSearch = window.location.search || '';
+        var match = iframeSearch.match(/hotpick-asin=([^&]*)/);
+        if (match && match[1]) {
+          var iframeAsin = decodeURIComponent(match[1]).trim();
+          if (iframeAsin) {
+            var attempts = 0;
+            var interval = setInterval(function () {
+              attempts++;
+              var input = document.querySelector('input[data-id="OmniboxId"]') ||
+                          document.querySelector('input[placeholder*="Scan or type product"]') ||
+                          document.querySelector('input[type="text"]');
+              if (input) {
+                clearInterval(interval);
+                input.focus();
+                setInputValue(input, iframeAsin);
+                // Show banner prompting user to press Enter
+                showEnterBanner(document, 'Press ENTER to search inventory');
+                waitForIframeResults(iframeAsin);
+              } else if (attempts >= 30) {
+                clearInterval(interval);
+              }
+            }, 500);
+          }
+        }
+      })();
+
+    } else if (isInIframe && hasAsin && hasQty && url.indexOf('/remote/ihm-inventory-removal-tool/') !== -1) {
+      // Inside Remove Inventory iframe — handle full flow
+      handleRemoveInventoryIframe();
+
+    } else if (!isInIframe && url.indexOf('na.store-management.f3.amazon.dev/search/details') !== -1) {
+      // Store Management page
+      try { runStoreManagementPage(); } catch (err) {
+        console.warn('[Hot Pick Missing Bags] Error on Store Management page:', err);
+      }
+
+    } else if (!isInIframe && url.indexOf('ui.us-west-2.prod.associatetools.ihm.amazon.dev') !== -1) {
+      if (hasAsin && hasQty) {
+        // Remove Inventory — click sidebar
+        try { runRemoveInventoryPage(); } catch (err) {
+          console.warn('[Hot Pick Missing Bags] Error on Remove Inventory page:', err);
+        }
+      } else if (hasAsin) {
+        // Inventory Viewer — click sidebar
+        try { runInventoryViewerPage(); } catch (err) {
+          console.warn('[Hot Pick Missing Bags] Error on Inventory Viewer page:', err);
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Conditional export for test compatibility
+  // ---------------------------------------------------------------------------
+
+  if (typeof module !== 'undefined') {
+    module.exports = {
+      validateToteId: validateToteId,
+      setInputValue: setInputValue,
+      generateInventoryViewerUrl: generateInventoryViewerUrl,
+      generateRemoveInventoryUrl: generateRemoveInventoryUrl,
+      computeTotals: computeTotals,
+      cleanupStaleLocationData: cleanupStaleLocationData,
+      STALE_THRESHOLD: STALE_THRESHOLD,
+      renderModal: renderModal,
+      runStoreManagementPage: runStoreManagementPage,
+      scrapeItemsFromPage: scrapeItemsFromPage,
+      findBestLocationInIframe: findBestLocationInIframe,
+      runInventoryViewerPage: runInventoryViewerPage,
+      runRemoveInventoryPage: runRemoveInventoryPage
+    };
+  }
+}());
