@@ -12,6 +12,7 @@
 // @grant        GM_listValues
 // @grant        GM_addValueChangeListener
 // @grant        GM_removeValueChangeListener
+// @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -23,6 +24,43 @@
   // ---------------------------------------------------------------------------
 
   var STALE_THRESHOLD = 60 * 60 * 1000; // 1 hour
+
+  // Site code → Location code mapping for Associate Tools URLs
+  var SITE_CODE_MAP = {
+    'UAZ1': 'US-AZ-19', 'UCA4': 'US-CA-175', 'UCA5': 'US-CA-173',
+    'UCO1': 'US-CO-33', 'UFL4': 'US-FL-51', 'UFL5': 'US-FL-52',
+    'UFL6': 'US-FL-53', 'UGA2': 'US-GA-21', 'UGA4': 'US-GA-22',
+    'UIL1': 'US-IL-72', 'UIL2': 'US-IL-71', 'UIN1': 'US-IN-7',
+    'ULA6': 'US-CA-142', 'UMA4': 'US-MA-45', 'UMD1': 'US-MD-17',
+    'UMN1': 'US-MN-11', 'UNC2': 'US-NC-24', 'UNC3': 'US-NC-23',
+    'UNJ1': 'US-NJ-40', 'UNJ2': 'US-NJ-48', 'UNV3': 'US-NV-10',
+    'UNY2': 'US-NY-72', 'UNY4': 'US-NY-61', 'UNY5': 'US-NY-73',
+    'UOH4': 'US-OH-15', 'UOH5': 'US-OH-14', 'UOR2': 'US-OR-11',
+    'UPA1': 'US-PA-23', 'USC1': 'US-CA-172', 'USD1': 'US-CA-169',
+    'USF1': 'US-CA-170', 'USF2': 'US-CA-171', 'USF4': 'US-CA-178',
+    'UTN1': 'US-TN-12', 'UTX3': 'US-TX-58', 'UTX4': 'US-TX-60',
+    'UTX7': 'US-TX-61', 'UTX8': 'US-TX-57', 'UTX9': 'US-TX-59',
+    'UVA1': 'US-VA-26', 'UVA4': 'US-VA-25', 'UVA5': 'US-VA-24',
+    'UWA1': 'US-WA-29', 'UWA2': 'US-WA-931', 'UWA6': 'US-WA-932',
+    'UWI2': 'US-WI-6', 'JFK2': 'US-NY-63'
+  };
+
+  // Detect current site's location code from the HWMS page (lazy — called when needed)
+  // (Site detection uses localStorage - no injection needed)
+
+  // Read activeSite from localStorage where the page stores it
+  function getCurrentStoreId() {
+    try {
+      // Read from localStorage key 'ACTIVE_SITE'
+      var activeSiteData = localStorage.getItem('ACTIVE_SITE');
+      if (activeSiteData) {
+        var parsed = JSON.parse(activeSiteData);
+        var fcId = parsed.fcId || parsed.storeAcronym || '';
+        if (fcId && SITE_CODE_MAP[fcId]) return SITE_CODE_MAP[fcId];
+      }
+    } catch (e) {}
+    return 'US-NC-24';
+  }
 
   // ---------------------------------------------------------------------------
   // Pure utility functions
@@ -62,7 +100,7 @@
    */
   function generateInventoryViewerUrl(asin) {
     var base = 'https://ui.us-west-2.prod.associatetools.ihm.amazon.dev/remote/ihm-associate-tools-base/index.html';
-    var params = '?auth=midway&domain=prod&region=iad&storeId=US-NC-24';
+    var params = '?auth=midway&domain=prod&region=iad&storeId=' + getCurrentStoreId();
     params += '&hotpick-asin=' + encodeURIComponent(asin);
     return base + params + '#/home';
   }
@@ -76,7 +114,7 @@
    */
   function generateRemoveInventoryUrl(asin, location, quantity) {
     var base = 'https://ui.us-west-2.prod.associatetools.ihm.amazon.dev/remote/ihm-associate-tools-base/index.html';
-    var params = '?auth=midway&domain=prod&region=iad&storeId=US-NC-24';
+    var params = '?auth=midway&domain=prod&region=iad&storeId=' + getCurrentStoreId();
     params += '&hotpick-asin=' + encodeURIComponent(asin);
     if (quantity != null) {
       params += '&hotpick-qty=' + encodeURIComponent(String(quantity));
